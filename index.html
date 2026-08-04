@@ -50,9 +50,9 @@
     <label>Discord Webhook URL:</label><br>
     <input type="text" id="webhookUrl" placeholder="https://discord.com/api/webhooks/..." style="width:90%;"><br><br>
     
-    <label>感度レベル (小＝高感度): <span id="threshVal">5</span></label><br>
-    <input type="range" id="threshold" min="1" max="100" value="5" oninput="document.getElementById('threshVal').innerText=this.value"><br>
-    <small style="color: #aaa;">※ 連投防止のため、一度送信すると次まで【15秒間】待機します。</small>
+    <label>感度レベル (数字が大きいほど鈍感): <span id="threshVal">20</span></label><br>
+    <input type="range" id="threshold" min="1" max="100" value="20" oninput="document.getElementById('threshVal').innerText=this.value"><br>
+    <small style="color: #aaa;">※ 誤検知が多い場合は数字を大きく（30〜50など）にしてください。</small>
   </div>
 
   <script>
@@ -63,8 +63,7 @@
     const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
     
     let motionInterval, prevFrame = null;
-    let lastAlertTime = 0;
-    let isSending = false; // 送信中フラグ（二重送信防止）
+    let isSending = false; // 送信中の重複実行防止のみに使用
 
     const SIGNALING_SERVER = 'wss://kannsi-8g8j.onrender.com';
 
@@ -183,7 +182,7 @@
       const ctx = canvas.getContext('2d');
 
       motionInterval = setInterval(() => {
-        if (!video.videoWidth || isSending) return; // 送信中なら検知をスキップ
+        if (!video.videoWidth || isSending) return;
 
         canvas.width = 320;
         canvas.height = 240;
@@ -194,15 +193,16 @@
           let diffCount = 0;
           const threshold = parseInt(document.getElementById('threshold').value);
 
+          // ピクセルの変化判定閾値を適正化
           for (let i = 0; i < currentFrame.data.length; i += 4) {
             const rDiff = Math.abs(currentFrame.data[i] - prevFrame.data[i]);
             const gDiff = Math.abs(currentFrame.data[i+1] - prevFrame.data[i+1]);
             const bDiff = Math.abs(currentFrame.data[i+2] - prevFrame.data[i+2]);
 
-            if (rDiff + gDiff + bDiff > 30) diffCount++;
+            if (rDiff + gDiff + bDiff > 60) diffCount++;
           }
 
-          const triggerLimit = (canvas.width * canvas.height) * (threshold / 5000);
+          const triggerLimit = (canvas.width * canvas.height) * (threshold / 1000);
 
           if (diffCount > triggerLimit) {
             triggerAlert(canvas);
@@ -212,25 +212,17 @@
       }, 500);
     }
 
-    // --- 画像送信処理 (エラー対策強化) ---
+    // --- 画像送信処理 (待機時間なし) ---
     async function triggerAlert(canvas) {
-      const now = Date.now();
-      // クールダウン: 15秒間は連投しない
-      if (now - lastAlertTime < 15000) return;
-      
       const webhookUrl = document.getElementById('webhookUrl').value.trim();
       if (!webhookUrl) return;
 
-      isSending = true; // 送信開始
-      lastAlertTime = now;
-      updateStatus("🚨 動体検知！画像作成中...");
+      isSending = true; // 送信中の二重起動防止
+      updateStatus("🚨 動体検知！画像送信中...");
 
       try {
-        // Blob作成をPromise化してタイムアウト・フリーズを防ぐ
         const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.7));
         if (!blob) throw new Error("画像データの作成に失敗しました");
-
-        updateStatus("🚨 Discordへ送信中...");
 
         const formData = new FormData();
         formData.append('payload_json', JSON.stringify({
@@ -244,18 +236,17 @@
         });
 
         if (response.ok || response.status === 204) {
-          updateStatus("🟢 Discordへ画像送信完了！(15秒待機中)");
+          updateStatus("🟢 Discordへ送信完了！");
         } else if (response.status === 429) {
-          // レート制限エラー（送りすぎ）
-          updateStatus("⚠️ 送りすぎのためDiscord側で制限中。少し時間を置きます。");
+          updateStatus("⚠️ 連投制限中 (Discord側の制限)");
         } else {
-          updateStatus(`❌ 送信エラー (HTTP Status: ${response.status})`);
+          updateStatus(`❌ 送信エラー (Status: ${response.status})`);
         }
       } catch (err) {
         console.error("送信エラー:", err);
         updateStatus("❌ エラー発生: " + err.message);
       } finally {
-        isSending = false; // 送信完了（または失敗）したら復帰
+        isSending = false; // 15秒待ちを削除し、送信が終わり次第即座に復帰
       }
     }
   </script>
