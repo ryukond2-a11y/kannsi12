@@ -34,8 +34,10 @@
   <!-- 映像 & 音声表示エリア -->
   <div class="card">
     <h3>🎥 映像・音声</h3>
+    <p>自分のカメラ映像:</p>
     <video id="localVideo" autoplay playsinline muted></video>
-    <video id="remoteVideo" autoplay playsinline></video>
+    <p>相手の映像:</p>
+    <video id="remoteVideo" autoplay playsinline controls></video>
     <canvas id="motionCanvas" style="display:none;"></canvas>
   </div>
 
@@ -52,12 +54,12 @@
     let localStream, pc, ws;
     let myRole = '';
     let roomId = '';
+    let offerInterval = null;
     const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
     
     let motionInterval, prevFrame = null;
     let lastAlertTime = 0;
 
-    // 先ほど作成した自前シグナリングサーバーのURL
     const SIGNALING_SERVER = 'wss://kannsi-8g8j.onrender.com';
 
     async function startApp(role) {
@@ -69,38 +71,52 @@
       document.getElementById('btnMonitor').disabled = true;
       updateStatus(`シグナリングサーバーに接続中... (${roomId})`);
 
-      // WebSocket接続
       ws = new WebSocket(SIGNALING_SERVER);
 
-     // index.html の ws.onopen 付近を書き換え
-ws.onopen = async () => {
-  updateStatus("サーバー接続完了。WebRTCを初期化中...");
-  setupPeerConnection();
+      ws.onopen = async () => {
+        updateStatus("サーバー接続完了。WebRTCを初期化中...");
 
-  if (myRole === 'camera') {
-    try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      document.getElementById('localVideo').srcObject = localStream;
-      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-      
-      startMotionDetection();
-      updateStatus("カメラ準備完了。モニターの接続を待機中...");
-    } catch (err) {
-      alert("カメラ/マイクの起動に失敗しました: " + err);
-    }
-  } else {
-    // モニター側：カメラが見つかるまで3秒ごとに接続要求（Offer）を送る
-    updateStatus("モニター準備完了。カメラを探しています...");
-    const offerInterval = setInterval(() => {
-      if (pc.connectionState === 'connected' || pc.iceConnectionState === 'completed') {
-        clearInterval(offerInterval); // 接続されたら停止
-      } else {
-        sendOffer();
-      }
-    }, 3000);
-  }
-};
-      // メッセージの自動受信ハンドラ
+        if (myRole === 'camera') {
+          try {
+            // カメラとマイクを明示的に取得
+            localStream = await navigator.mediaDevices.getUserMedia({ 
+              video: { width: { ideal: 640 }, height: { ideal: 480 } }, 
+              audio: true 
+            });
+            document.getElementById('localVideo').srcObject = localStream;
+            
+            setupPeerConnection();
+            
+            // トラックを1つずつ確実にPeerConnectionへ追加
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+            
+            startMotionDetection();
+            updateStatus("📷 カメラ準備完了。モニターからの接続を待機中...");
+          } catch (err) {
+            alert("カメラ/マイクの起動に失敗しました: " + err);
+            updateStatus("エラー: カメラ起動失敗");
+          }
+        } else {
+          setupPeerConnection();
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+          } catch (e) {
+            console.log("マイクなし受信用として動作");
+          }
+          updateStatus("📺 モニター準備完了。カメラを探しています...");
+          
+          offerInterval = setInterval(() => {
+            if (pc.connectionState === 'connected' || pc.iceConnectionState === 'completed') {
+              clearInterval(offerInterval);
+            } else {
+              sendOffer();
+            }
+          }, 3000);
+          sendOffer();
+        }
+      };
+
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
         if (msg.roomId !== roomId || msg.sender === myRole) return;
@@ -131,13 +147,22 @@ ws.onopen = async () => {
         }
       };
 
+      // 相手からの映像/音声を受信したときの処理
       pc.ontrack = (event) => {
-        document.getElementById('remoteVideo').srcObject = event.streams[0];
+        const remoteVideo = document.getElementById('remoteVideo');
+        if (remoteVideo.srcObject !== event.streams[0]) {
+          remoteVideo.srcObject = event.streams[0];
+        }
+        // ブラウザの自動再生ブロック対策として明示的にplayを実行
+        remoteVideo.play().catch(e => console.log("再生ブロック解除待ち:", e));
+        
         updateStatus("🟢 自動接続完了！映像・音声をリアルタイム通信中");
+        if (offerInterval) clearInterval(offerInterval);
       };
     }
 
     async function sendOffer() {
+      if (!pc || pc.signalingState !== 'stable') return;
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       sendSignal({ sdp: pc.localDescription });
@@ -153,7 +178,6 @@ ws.onopen = async () => {
       document.getElementById('statusText').innerText = txt;
     }
 
-    // --- 動体検知処理 ---
     function startMotionDetection() {
       const video = document.getElementById('localVideo');
       const canvas = document.getElementById('motionCanvas');
@@ -187,7 +211,6 @@ ws.onopen = async () => {
       }, 500);
     }
 
-    // --- スマホ通知（Webhook） ---
     function triggerAlert() {
       const now = Date.now();
       if (now - lastAlertTime < 30000) return;
