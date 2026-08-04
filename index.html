@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>防犯カメラ & モニター</title>
+  <title>簡易防犯カメラ</title>
   <style>
     body { font-family: sans-serif; background: #121212; color: #fff; margin: 0; padding: 15px; }
     h2 { margin-top: 0; }
@@ -14,30 +14,40 @@
     button:disabled { background: #555; cursor: not-allowed; }
     input[type="text"] { background: #2b2b2b; color: #fff; border: 1px solid #444; border-radius: 4px; }
     .status { font-weight: bold; color: #00ffcc; margin-bottom: 10px; padding: 10px; background: #222; border-radius: 4px; }
+    .role-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; background: #333; font-size: 12px; margin-bottom: 10px; }
   </style>
 </head>
 <body>
 
-  <h2>📱 防犯カメラ ＆ 監視システム</h2>
-  <div class="status" id="statusText">ルームIDを入力して起動モードを選択してください</div>
+  <h2>📱 防犯カメラ（一方向配信）</h2>
+  <div class="status" id="statusText">モードを選択してください</div>
 
   <!-- ルームID設定 -->
   <div class="card">
     <h3>🔑 接続設定</h3>
     <label>ルームID (同じ文字列を入力):</label><br>
-    <input type="text" id="roomId" value="my-home-room-123" style="width: 80%; padding: 8px; margin-top: 5px;"><br><br>
+    <input type="text" id="roomId" value="my-room-777" style="width: 80%; padding: 8px; margin-top: 5px;"><br><br>
     
-    <button id="btnCamera" onclick="startApp('camera')">📷 カメラ端末（設置側）として起動</button>
-    <button id="btnMonitor" onclick="startApp('monitor')">📺 モニター端末（閲覧側）として起動</button>
+    <button id="btnCamera" onclick="initCamera()">📷 1. 配信する（カメラ設置側）</button>
+    <button id="btnMonitor" onclick="initMonitor()">📺 2. 見る（モニター閲覧側）</button>
   </div>
 
-  <!-- 映像 & 音声表示エリア -->
+  <!-- 映像表示エリア -->
   <div class="card">
-    <h3>🎥 映像・音声</h3>
-    <p>自分のカメラ映像:</p>
-    <video id="localVideo" autoplay playsinline muted></video>
-    <p>相手の映像:</p>
-    <video id="remoteVideo" autoplay playsinline controls></video>
+    <div id="roleBadge" class="role-badge">未接続</div>
+    
+    <!-- カメラ側用：自分のカメラ映像 -->
+    <div id="cameraArea" style="display:none;">
+      <p>📹 カメラのリアルタイム映像（送信中）:</p>
+      <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+
+    <!-- モニター側用：相手から送られてくる映像 -->
+    <div id="monitorArea" style="display:none;">
+      <p>📺 カメラから受信中の映像:</p>
+      <video id="remoteVideo" autoplay playsinline controls style="width:100%; min-height:240px; background:#222;"></video>
+    </div>
+
     <canvas id="motionCanvas" style="display:none;"></canvas>
   </div>
 
@@ -54,7 +64,6 @@
     let localStream, pc, ws;
     let myRole = '';
     let roomId = '';
-    let offerInterval = null;
     const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
     
     let motionInterval, prevFrame = null;
@@ -62,58 +71,59 @@
 
     const SIGNALING_SERVER = 'wss://kannsi-8g8j.onrender.com';
 
-    async function startApp(role) {
-      myRole = role;
+    // -------------------------------------------------------------
+    // 1. 送信側（カメラ）の処理
+    // -------------------------------------------------------------
+    async function initCamera() {
+      myRole = 'camera';
+      disableButtons();
+      document.getElementById('roleBadge').innerText = "モード: 📷 カメラ（送信側）";
+      document.getElementById('cameraArea').style.display = 'block';
+
+      try {
+        // カメラとマイクのストリーム取得
+        localStream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: { ideal: 640 }, height: { ideal: 480 } }, 
+          audio: true 
+        });
+        document.getElementById('localVideo').srcObject = localStream;
+        
+        startMotionDetection();
+        connectWebSocket();
+      } catch (err) {
+        alert("カメラ/マイクの起動に失敗しました: " + err);
+        updateStatus("エラー: カメラ起動失敗");
+      }
+    }
+
+    // -------------------------------------------------------------
+    // 2. 受信側（モニター）の処理
+    // -------------------------------------------------------------
+    function initMonitor() {
+      myRole = 'monitor';
+      disableButtons();
+      document.getElementById('roleBadge').innerText = "モード: 📺 モニター（受信側）";
+      document.getElementById('monitorArea').style.display = 'block';
+
+      connectWebSocket();
+    }
+
+    // -------------------------------------------------------------
+    // WebSocket ＆ WebRTC 接続管理
+    // -------------------------------------------------------------
+    function connectWebSocket() {
       roomId = document.getElementById('roomId').value.trim();
       if (!roomId) return alert("ルームIDを入力してください");
 
-      document.getElementById('btnCamera').disabled = true;
-      document.getElementById('btnMonitor').disabled = true;
-      updateStatus(`シグナリングサーバーに接続中... (${roomId})`);
-
+      updateStatus(`サーバー接続中... (ID: ${roomId})`);
       ws = new WebSocket(SIGNALING_SERVER);
 
-      ws.onopen = async () => {
-        updateStatus("サーバー接続完了。WebRTCを初期化中...");
-
-        if (myRole === 'camera') {
-          try {
-            // カメラとマイクを明示的に取得
-            localStream = await navigator.mediaDevices.getUserMedia({ 
-              video: { width: { ideal: 640 }, height: { ideal: 480 } }, 
-              audio: true 
-            });
-            document.getElementById('localVideo').srcObject = localStream;
-            
-            setupPeerConnection();
-            
-            // トラックを1つずつ確実にPeerConnectionへ追加
-            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-            
-            startMotionDetection();
-            updateStatus("📷 カメラ準備完了。モニターからの接続を待機中...");
-          } catch (err) {
-            alert("カメラ/マイクの起動に失敗しました: " + err);
-            updateStatus("エラー: カメラ起動失敗");
-          }
-        } else {
-          setupPeerConnection();
-          try {
-            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-          } catch (e) {
-            console.log("マイクなし受信用として動作");
-          }
-          updateStatus("📺 モニター準備完了。カメラを探しています...");
-          
-          offerInterval = setInterval(() => {
-            if (pc.connectionState === 'connected' || pc.iceConnectionState === 'completed') {
-              clearInterval(offerInterval);
-            } else {
-              sendOffer();
-            }
-          }, 3000);
-          sendOffer();
+      ws.onopen = () => {
+        updateStatus("サーバー接続完了。待機中...");
+        
+        // モニター側から「映像を送ってください」と要求（Offer）を出す
+        if (myRole === 'monitor') {
+          startOfferLoop();
         }
       };
 
@@ -121,51 +131,66 @@
         const msg = JSON.parse(event.data);
         if (msg.roomId !== roomId || msg.sender === myRole) return;
 
+        // モニターからの要求（Offer）を受け取ったら、カメラ側がAnswerを返す
         if (msg.sdp) {
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          if (msg.sdp.type === 'offer') {
+          if (msg.sdp.type === 'offer' && myRole === 'camera') {
+            await setupPeerConnection();
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            
+            // 映像・音声をPeerConnectionに乗せる
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             sendSignal({ sdp: pc.localDescription });
+            updateStatus("🟢 モニターへ映像を送信中！");
+          } 
+          else if (msg.sdp.type === 'answer' && myRole === 'monitor') {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
           }
-        } else if (msg.candidate) {
+        } else if (msg.candidate && pc) {
           try {
             await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
           } catch (e) {
-            console.error("ICE Candidate追加エラー", e);
+            console.error("ICE追加エラー", e);
           }
         }
       };
     }
 
-    function setupPeerConnection() {
+    async function setupPeerConnection() {
+      if (pc) pc.close();
       pc = new RTCPeerConnection(config);
 
       pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          sendSignal({ candidate: event.candidate });
-        }
+        if (event.candidate) sendSignal({ candidate: event.candidate });
       };
 
-      // 相手からの映像/音声を受信したときの処理
+      // モニター側が映像を受信したとき
       pc.ontrack = (event) => {
-        const remoteVideo = document.getElementById('remoteVideo');
-        if (remoteVideo.srcObject !== event.streams[0]) {
+        if (myRole === 'monitor') {
+          const remoteVideo = document.getElementById('remoteVideo');
           remoteVideo.srcObject = event.streams[0];
+          remoteVideo.play().catch(e => console.log("再生ブロック解除待ち", e));
+          updateStatus("🟢 映像受信完了！リアルタイム監視中");
         }
-        // ブラウザの自動再生ブロック対策として明示的にplayを実行
-        remoteVideo.play().catch(e => console.log("再生ブロック解除待ち:", e));
-        
-        updateStatus("🟢 自動接続完了！映像・音声をリアルタイム通信中");
-        if (offerInterval) clearInterval(offerInterval);
       };
     }
 
-    async function sendOffer() {
-      if (!pc || pc.signalingState !== 'stable') return;
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      sendSignal({ sdp: pc.localDescription });
+    // モニター側：カメラが見つかるまで接続リクエストを定期送信
+    let offerTimer = null;
+    function startOfferLoop() {
+      offerTimer = setInterval(async () => {
+        if (pc && (pc.connectionState === 'connected' || pc.iceConnectionState === 'completed')) {
+          clearInterval(offerTimer);
+          return;
+        }
+        await setupPeerConnection();
+        const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
+        await pc.setLocalDescription(offer);
+        sendSignal({ sdp: pc.localDescription });
+        updateStatus("カメラを探しています... (接続要求送信中)");
+      }, 3000);
     }
 
     function sendSignal(data) {
@@ -174,10 +199,18 @@
       }
     }
 
+    function disableButtons() {
+      document.getElementById('btnCamera').disabled = true;
+      document.getElementById('btnMonitor').disabled = true;
+    }
+
     function updateStatus(txt) {
       document.getElementById('statusText').innerText = txt;
     }
 
+    // -------------------------------------------------------------
+    // 動体検知 ＆ スマホ通知
+    // -------------------------------------------------------------
     function startMotionDetection() {
       const video = document.getElementById('localVideo');
       const canvas = document.getElementById('motionCanvas');
