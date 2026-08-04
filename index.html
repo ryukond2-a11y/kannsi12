@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>防犯カメラ & モニター</title>
+  <style>
+    body { font-family: sans-serif; background: #121212; color: #fff; margin: 0; padding: 15px; }
+    h2 { margin-top: 0; }
+    .card { background: #1e1e1e; padding: 15px; border-radius: 8px; margin-bottom: 15px; }
+    video, canvas { width: 100%; max-width: 480px; background: #000; border-radius: 6px; display: block; margin-bottom: 10px; }
+    button, input { padding: 10px 15px; font-size: 14px; margin: 5px 2px; border: none; border-radius: 4px; }
+    button { background: #007bff; color: white; cursor: pointer; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    input[type="text"] { background: #2b2b2b; color: #fff; border: 1px solid #444; border-radius: 4px; }
+    .status { font-weight: bold; color: #00ffcc; margin-bottom: 10px; padding: 10px; background: #222; border-radius: 4px; }
+  </style>
+</head>
+<body>
+
+  <h2>📱 防犯カメラ ＆ 監視システム</h2>
+  <div class="status" id="statusText">ルームIDを入力して起動モードを選択してください</div>
+
+  <!-- ルームID設定 -->
+  <div class="card">
+    <h3>🔑 接続設定</h3>
+    <label>ルームID (同じ文字列を入力):</label><br>
+    <input type="text" id="roomId" value="my-home-room-123" style="width: 80%; padding: 8px; margin-top: 5px;"><br><br>
+    
+    <button id="btnCamera" onclick="startApp('camera')">📷 カメラ端末（設置側）として起動</button>
+    <button id="btnMonitor" onclick="startApp('monitor')">📺 モニター端末（閲覧側）として起動</button>
+  </div>
+
+  <!-- 映像 & 音声表示エリア -->
+  <div class="card">
+    <h3>🎥 映像・音声</h3>
+    <video id="localVideo" autoplay playsinline muted></video>
+    <video id="remoteVideo" autoplay playsinline></video>
+    <canvas id="motionCanvas" style="display:none;"></canvas>
+  </div>
+
+  <!-- 動体検知 ＆ スマホ通知設定 -->
+  <div class="card">
+    <h3>🚨 動体検知 ＆ スマホ通知</h3>
+    <label>Webhook URL (LINE Notify / Discord等):</label><br>
+    <input type="text" id="webhookUrl" placeholder="https://..." style="width:90%;"><br><br>
+    <label>感度閾値: <span id="threshVal">30</span></label><br>
+    <input type="range" id="threshold" min="10" max="100" value="30" onchange="document.getElementById('threshVal').innerText=this.value">
+  </div>
+
+  <script>
+    let localStream, pc, ws;
+    let myRole = '';
+    let roomId = '';
+    const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    
+    let motionInterval, prevFrame = null;
+    let lastAlertTime = 0;
+
+    // 先ほど作成した自前シグナリングサーバーのURL
+    const SIGNALING_SERVER = 'wss://kannsi-8g8j.onrender.com';
+
+    async function startApp(role) {
+      myRole = role;
+      roomId = document.getElementById('roomId').value.trim();
+      if (!roomId) return alert("ルームIDを入力してください");
+
+      document.getElementById('btnCamera').disabled = true;
+      document.getElementById('btnMonitor').disabled = true;
+      updateStatus(`シグナリングサーバーに接続中... (${roomId})`);
+
+      // WebSocket接続
+      ws = new WebSocket(SIGNALING_SERVER);
+
+      ws.onopen = async () => {
+        updateStatus("サーバー接続完了。WebRTCを初期化中...");
+        setupPeerConnection();
+
+        if (myRole === 'camera') {
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+            document.getElementById('localVideo').srcObject = localStream;
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+            
+            startMotionDetection();
+            updateStatus("カメラ準備完了。モニターの接続を待機中...");
+          } catch (err) {
+            alert("カメラ/マイクの起動に失敗しました: " + err);
+            updateStatus("エラー: カメラ起動失敗");
+          }
+        } else {
+          // モニター側
+          try {
+            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+          } catch (e) {
+            console.log("マイクなしで受信用として動作します");
+          }
+          updateStatus("モニター準備完了。カメラを探しています...");
+          sendOffer();
+        }
+      };
+
+      // メッセージの自動受信ハンドラ
+      ws.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.roomId !== roomId || msg.sender === myRole) return;
+
+        if (msg.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          if (msg.sdp.type === 'offer') {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            sendSignal({ sdp: pc.localDescription });
+          }
+        } else if (msg.candidate) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+          } catch (e) {
+            console.error("ICE Candidate追加エラー", e);
+          }
+        }
+      };
+    }
+
+    function setupPeerConnection() {
+      pc = new RTCPeerConnection(config);
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          sendSignal({ candidate: event.candidate });
+        }
+      };
+
+      pc.ontrack = (event) => {
+        document.getElementById('remoteVideo').srcObject = event.streams[0];
+        updateStatus("🟢 自動接続完了！映像・音声をリアルタイム通信中");
+      };
+    }
+
+    async function sendOffer() {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sendSignal({ sdp: pc.localDescription });
+    }
+
+    function sendSignal(data) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ ...data, roomId: roomId, sender: myRole }));
+      }
+    }
+
+    function updateStatus(txt) {
+      document.getElementById('statusText').innerText = txt;
+    }
+
+    // --- 動体検知処理 ---
+    function startMotionDetection() {
+      const video = document.getElementById('localVideo');
+      const canvas = document.getElementById('motionCanvas');
+      const ctx = canvas.getContext('2d');
+
+      motionInterval = setInterval(() => {
+        if (!video.videoWidth) return;
+
+        canvas.width = 160;
+        canvas.height = 120;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const currentFrame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+        if (prevFrame) {
+          let diffCount = 0;
+          const threshold = parseInt(document.getElementById('threshold').value);
+
+          for (let i = 0; i < currentFrame.data.length; i += 4) {
+            const rDiff = Math.abs(currentFrame.data[i] - prevFrame.data[i]);
+            const gDiff = Math.abs(currentFrame.data[i+1] - prevFrame.data[i+1]);
+            const bDiff = Math.abs(currentFrame.data[i+2] - prevFrame.data[i+2]);
+
+            if (rDiff + gDiff + bDiff > 100) diffCount++;
+          }
+
+          if (diffCount > (canvas.width * canvas.height) * (threshold / 1000)) {
+            triggerAlert();
+          }
+        }
+        prevFrame = currentFrame;
+      }, 500);
+    }
+
+    // --- スマホ通知（Webhook） ---
+    function triggerAlert() {
+      const now = Date.now();
+      if (now - lastAlertTime < 30000) return;
+      lastAlertTime = now;
+
+      updateStatus("🚨 動体検知！スマホへ通知を送信中...");
+
+      const webhookUrl = document.getElementById('webhookUrl').value;
+      if (webhookUrl) {
+        fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: "🚨 【防犯カメラ】動体を検知しました！" })
+        }).catch(err => console.error("通知エラー:", err));
+      }
+    }
+  </script>
+</body>
+</html>
