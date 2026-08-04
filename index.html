@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>簡易防犯カメラ</title>
+  <title>防犯カメラ</title>
   <style>
     body { font-family: sans-serif; background: #121212; color: #fff; margin: 0; padding: 15px; }
     h2 { margin-top: 0; }
@@ -14,44 +14,39 @@
     button:disabled { background: #555; cursor: not-allowed; }
     input[type="text"] { background: #2b2b2b; color: #fff; border: 1px solid #444; border-radius: 4px; }
     .status { font-weight: bold; color: #00ffcc; margin-bottom: 10px; padding: 10px; background: #222; border-radius: 4px; }
-    .role-badge { display: inline-block; padding: 4px 8px; border-radius: 4px; background: #333; font-size: 12px; margin-bottom: 10px; }
   </style>
 </head>
 <body>
 
-  <h2>📱 防犯カメラ（一方向配信）</h2>
+  <h2>📱 防犯カメラシステム</h2>
   <div class="status" id="statusText">モードを選択してください</div>
 
-  <!-- ルームID設定 -->
   <div class="card">
-    <h3>🔑 接続設定</h3>
-    <label>ルームID (同じ文字列を入力):</label><br>
+    <label>🔑 ルームID (同じ文字列を入力):</label><br>
     <input type="text" id="roomId" value="my-room-777" style="width: 80%; padding: 8px; margin-top: 5px;"><br><br>
     
-    <button id="btnCamera" onclick="initCamera()">📷 1. 配信する（カメラ設置側）</button>
-    <button id="btnMonitor" onclick="initMonitor()">📺 2. 見る（モニター閲覧側）</button>
+    <button id="btnCamera" onclick="startCamera()">📷 1. カメラ側（映像を送信する）</button>
+    <button id="btnMonitor" onclick="startMonitor()">📺 2. モニター側（映像を見るだけ）</button>
   </div>
 
-  <!-- 映像表示エリア -->
   <div class="card">
-    <div id="roleBadge" class="role-badge">未接続</div>
+    <h3>🎥 画面エリア</h3>
     
-    <!-- カメラ側用：自分のカメラ映像 -->
-    <div id="cameraArea" style="display:none;">
-      <p>📹 カメラのリアルタイム映像（送信中）:</p>
+    <!-- カメラ側：自分のカメラ映像確認用 -->
+    <div id="cameraBox" style="display:none;">
+      <p>📹 カメラ撮影中（送信中）:</p>
       <video id="localVideo" autoplay playsinline muted></video>
     </div>
 
-    <!-- モニター側用：相手から送られてくる映像 -->
-    <div id="monitorArea" style="display:none;">
-      <p>📺 カメラから受信中の映像:</p>
-      <video id="remoteVideo" autoplay playsinline controls style="width:100%; min-height:240px; background:#222;"></video>
+    <!-- モニター側：相手（カメラ）から送られてきた映像 -->
+    <div id="monitorBox" style="display:none;">
+      <p>📺 受信した映像（監視画面）:</p>
+      <video id="remoteVideo" autoplay playsinline controls style="width:100%; min-height:240px; background:#000;"></video>
     </div>
 
     <canvas id="motionCanvas" style="display:none;"></canvas>
   </div>
 
-  <!-- 動体検知 ＆ スマホ通知設定 -->
   <div class="card">
     <h3>🚨 動体検知 ＆ スマホ通知</h3>
     <label>Webhook URL (LINE Notify / Discord等):</label><br>
@@ -64,6 +59,7 @@
     let localStream, pc, ws;
     let myRole = '';
     let roomId = '';
+    let offerTimer = null;
     const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
     
     let motionInterval, prevFrame = null;
@@ -71,17 +67,14 @@
 
     const SIGNALING_SERVER = 'wss://kannsi-8g8j.onrender.com';
 
-    // -------------------------------------------------------------
-    // 1. 送信側（カメラ）の処理
-    // -------------------------------------------------------------
-    async function initCamera() {
+    // --- 1. カメラ側（映像を送る） ---
+    async function startCamera() {
       myRole = 'camera';
       disableButtons();
-      document.getElementById('roleBadge').innerText = "モード: 📷 カメラ（送信側）";
-      document.getElementById('cameraArea').style.display = 'block';
+      document.getElementById('cameraBox').style.display = 'block';
 
       try {
-        // カメラとマイクのストリーム取得
+        // カメラとマイクを取得
         localStream = await navigator.mediaDevices.getUserMedia({ 
           video: { width: { ideal: 640 }, height: { ideal: 480 } }, 
           audio: true 
@@ -91,37 +84,30 @@
         startMotionDetection();
         connectWebSocket();
       } catch (err) {
-        alert("カメラ/マイクの起動に失敗しました: " + err);
-        updateStatus("エラー: カメラ起動失敗");
+        alert("カメラ起動失敗: " + err);
       }
     }
 
-    // -------------------------------------------------------------
-    // 2. 受信側（モニター）の処理
-    // -------------------------------------------------------------
-    function initMonitor() {
+    // --- 2. モニター側（映像を見るだけ・カメラ不要） ---
+    function startMonitor() {
       myRole = 'monitor';
       disableButtons();
-      document.getElementById('roleBadge').innerText = "モード: 📺 モニター（受信側）";
-      document.getElementById('monitorArea').style.display = 'block';
-
+      document.getElementById('monitorBox').style.display = 'block';
       connectWebSocket();
     }
 
-    // -------------------------------------------------------------
-    // WebSocket ＆ WebRTC 接続管理
-    // -------------------------------------------------------------
+    // --- 通信処理 ---
     function connectWebSocket() {
       roomId = document.getElementById('roomId').value.trim();
       if (!roomId) return alert("ルームIDを入力してください");
 
-      updateStatus(`サーバー接続中... (ID: ${roomId})`);
+      updateStatus(`サーバー接続中...`);
       ws = new WebSocket(SIGNALING_SERVER);
 
       ws.onopen = () => {
         updateStatus("サーバー接続完了。待機中...");
         
-        // モニター側から「映像を送ってください」と要求（Offer）を出す
+        // モニター側の場合、カメラへ「映像を送ってください」と要求し続ける
         if (myRole === 'monitor') {
           startOfferLoop();
         }
@@ -131,34 +117,32 @@
         const msg = JSON.parse(event.data);
         if (msg.roomId !== roomId || msg.sender === myRole) return;
 
-        // モニターからの要求（Offer）を受け取ったら、カメラ側がAnswerを返す
         if (msg.sdp) {
           if (msg.sdp.type === 'offer' && myRole === 'camera') {
-            await setupPeerConnection();
+            // モニター側から要求が来たらPeerConnectionを作成して自分の映像を乗せる
+            createPeerConnection();
             await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-            
-            // 映像・音声をPeerConnectionに乗せる
+
             localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             sendSignal({ sdp: pc.localDescription });
-            updateStatus("🟢 モニターへ映像を送信中！");
+            updateStatus("🟢 モニター側へ映像送信を開始しました！");
           } 
           else if (msg.sdp.type === 'answer' && myRole === 'monitor') {
+            // カメラ側から返事が来たらセットする
             await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
           }
         } else if (msg.candidate && pc) {
           try {
             await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-          } catch (e) {
-            console.error("ICE追加エラー", e);
-          }
+          } catch (e) {}
         }
       };
     }
 
-    async function setupPeerConnection() {
+    function createPeerConnection() {
       if (pc) pc.close();
       pc = new RTCPeerConnection(config);
 
@@ -166,30 +150,30 @@
         if (event.candidate) sendSignal({ candidate: event.candidate });
       };
 
-      // モニター側が映像を受信したとき
+      // 映像を受け取ったときの処理（モニター側）
       pc.ontrack = (event) => {
         if (myRole === 'monitor') {
           const remoteVideo = document.getElementById('remoteVideo');
           remoteVideo.srcObject = event.streams[0];
-          remoteVideo.play().catch(e => console.log("再生ブロック解除待ち", e));
-          updateStatus("🟢 映像受信完了！リアルタイム監視中");
+          remoteVideo.play();
+          updateStatus("🟢 映像を受信しました！監視中");
+          if (offerTimer) clearInterval(offerTimer);
         }
       };
     }
 
-    // モニター側：カメラが見つかるまで接続リクエストを定期送信
-    let offerTimer = null;
+    // モニター側：映像が届くまで3秒ごとにカメラを探す
     function startOfferLoop() {
       offerTimer = setInterval(async () => {
-        if (pc && (pc.connectionState === 'connected' || pc.iceConnectionState === 'completed')) {
-          clearInterval(offerTimer);
-          return;
-        }
-        await setupPeerConnection();
-        const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: true });
+        createPeerConnection();
+        // 映像と音声「のみ」を受信したいという条件でOfferを作成
+        const offer = await pc.createOffer({ 
+          offerToReceiveVideo: true, 
+          offerToReceiveAudio: true 
+        });
         await pc.setLocalDescription(offer);
         sendSignal({ sdp: pc.localDescription });
-        updateStatus("カメラを探しています... (接続要求送信中)");
+        updateStatus("カメラを探しています...");
       }, 3000);
     }
 
@@ -208,9 +192,7 @@
       document.getElementById('statusText').innerText = txt;
     }
 
-    // -------------------------------------------------------------
-    // 動体検知 ＆ スマホ通知
-    // -------------------------------------------------------------
+    // --- 動体検知 ＆ スマホ通知 ---
     function startMotionDetection() {
       const video = document.getElementById('localVideo');
       const canvas = document.getElementById('motionCanvas');
