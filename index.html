@@ -13,7 +13,7 @@
     button { background: #007bff; color: white; cursor: pointer; }
     button:disabled { background: #555; cursor: not-allowed; }
     input[type="text"] { background: #2b2b2b; color: #fff; border: 1px solid #444; border-radius: 4px; }
-    .status { font-weight: bold; color: #00ffcc; margin-bottom: 10px; padding: 10px; background: #222; border-radius: 4px; }
+    .status { font-weight: bold; color: #00ffcc; margin-bottom: 10px; padding: 10px; background: #222; border-radius: 4px; word-break: break-all; }
   </style>
 </head>
 <body>
@@ -32,19 +32,16 @@
   <div class="card">
     <h3>🎥 画面エリア</h3>
     
-    <!-- カメラ側：自分のカメラ映像確認用 -->
     <div id="cameraBox" style="display:none;">
       <p>📹 カメラ撮影中（送信中）:</p>
       <video id="localVideo" autoplay playsinline muted></video>
     </div>
 
-    <!-- モニター側：相手（カメラ）から送られてきた映像 -->
     <div id="monitorBox" style="display:none;">
       <p>📺 受信した映像（監視画面）:</p>
       <video id="remoteVideo" autoplay playsinline controls style="width:100%; min-height:240px; background:#000;"></video>
     </div>
 
-    <!-- キャプチャ・動体検知用 canvas -->
     <canvas id="motionCanvas" style="display:none;"></canvas>
   </div>
 
@@ -53,10 +50,9 @@
     <label>Discord Webhook URL:</label><br>
     <input type="text" id="webhookUrl" placeholder="https://discord.com/api/webhooks/..." style="width:90%;"><br><br>
     
-    <!-- 感度設定：1（超高感度）〜 100（低感度） -->
-    <label>感度レベル (小＝高感度): <span id="threshVal">1</span></label><br>
-    <input type="range" id="threshold" min="1" max="100" value="1" oninput="document.getElementById('threshVal').innerText=this.value"><br>
-    <small style="color: #aaa;">※ 1に設定すると、光の微かな揺れやわずかな動きでも即反応します。</small>
+    <label>感度レベル (小＝高感度): <span id="threshVal">5</span></label><br>
+    <input type="range" id="threshold" min="1" max="100" value="5" oninput="document.getElementById('threshVal').innerText=this.value"><br>
+    <small style="color: #aaa;">※ 連投防止のため、一度送信すると次まで【15秒間】待機します。</small>
   </div>
 
   <script>
@@ -68,10 +64,10 @@
     
     let motionInterval, prevFrame = null;
     let lastAlertTime = 0;
+    let isSending = false; // 送信中フラグ（二重送信防止）
 
     const SIGNALING_SERVER = 'wss://kannsi-8g8j.onrender.com';
 
-    // --- 1. カメラ側 ---
     async function startCamera() {
       myRole = 'camera';
       disableButtons();
@@ -91,7 +87,6 @@
       }
     }
 
-    // --- 2. モニター側 ---
     function startMonitor() {
       myRole = 'monitor';
       disableButtons();
@@ -99,7 +94,6 @@
       connectWebSocket();
     }
 
-    // --- WebSocket 通信 ---
     function connectWebSocket() {
       roomId = document.getElementById('roomId').value.trim();
       if (!roomId) return alert("ルームIDを入力してください");
@@ -182,16 +176,15 @@
       document.getElementById('statusText').innerText = txt;
     }
 
-    // --- 超過敏動体検知 ＆ 画像送信処理 ---
+    // --- 動体検知処理 ---
     function startMotionDetection() {
       const video = document.getElementById('localVideo');
       const canvas = document.getElementById('motionCanvas');
       const ctx = canvas.getContext('2d');
 
       motionInterval = setInterval(() => {
-        if (!video.videoWidth) return;
+        if (!video.videoWidth || isSending) return; // 送信中なら検知をスキップ
 
-        // 検知用の解像度
         canvas.width = 320;
         canvas.height = 240;
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -201,57 +194,69 @@
           let diffCount = 0;
           const threshold = parseInt(document.getElementById('threshold').value);
 
-          // ピクセルの変化を判定（RGB合計値の差が 20 以上で「動き」と判定）
           for (let i = 0; i < currentFrame.data.length; i += 4) {
             const rDiff = Math.abs(currentFrame.data[i] - prevFrame.data[i]);
             const gDiff = Math.abs(currentFrame.data[i+1] - prevFrame.data[i+1]);
             const bDiff = Math.abs(currentFrame.data[i+2] - prevFrame.data[i+2]);
 
-            if (rDiff + gDiff + bDiff > 20) diffCount++;
+            if (rDiff + gDiff + bDiff > 30) diffCount++;
           }
 
-          // 閾値に応じたトリガー計算（スライダー1の時に極めて小さい変化でも反応）
-          const triggerLimit = (canvas.width * canvas.height) * (threshold / 10000);
+          const triggerLimit = (canvas.width * canvas.height) * (threshold / 5000);
 
           if (diffCount > triggerLimit) {
             triggerAlert(canvas);
           }
         }
         prevFrame = currentFrame;
-      }, 300); // 300ms間隔でチェック（高速化）
+      }, 500);
     }
 
-    // 画像付き通知を送信
-    function triggerAlert(canvas) {
+    // --- 画像送信処理 (エラー対策強化) ---
+    async function triggerAlert(canvas) {
       const now = Date.now();
-      // スパム防止（一度検知したら10秒間は再送信を制限）
-      if (now - lastAlertTime < 10000) return;
-      lastAlertTime = now;
-
-      updateStatus("🚨 動体検知！画像付き通知を Discord に送信中...");
-
+      // クールダウン: 15秒間は連投しない
+      if (now - lastAlertTime < 15000) return;
+      
       const webhookUrl = document.getElementById('webhookUrl').value.trim();
       if (!webhookUrl) return;
 
-      // canvasの現在の画像をBlob（画像ファイルデータ）に変換して送信
-      canvas.toBlob((blob) => {
-        if (!blob) return;
+      isSending = true; // 送信開始
+      lastAlertTime = now;
+      updateStatus("🚨 動体検知！画像作成中...");
+
+      try {
+        // Blob作成をPromise化してタイムアウト・フリーズを防ぐ
+        const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.7));
+        if (!blob) throw new Error("画像データの作成に失敗しました");
+
+        updateStatus("🚨 Discordへ送信中...");
 
         const formData = new FormData();
-        // Discord用のペイロード作成
         formData.append('payload_json', JSON.stringify({
-          content: "🚨 【防犯カメラ】動体を検知しました！検知時の写真を送信します。"
+          content: "🚨 【防犯カメラ】動体を検知しました！"
         }));
-        // 画像ファイルを添付 (ファイル名: capture.jpg)
         formData.append('file', blob, 'capture.jpg');
 
-        fetch(webhookUrl, {
+        const response = await fetch(webhookUrl, {
           method: 'POST',
           body: formData
-        })
-        .then(() => updateStatus("🟢 Discordへ画像を送信しました！"))
-        .catch(err => console.error("Discord画像送信エラー:", err));
-      }, 'image/jpeg', 0.8);
+        });
+
+        if (response.ok || response.status === 204) {
+          updateStatus("🟢 Discordへ画像送信完了！(15秒待機中)");
+        } else if (response.status === 429) {
+          // レート制限エラー（送りすぎ）
+          updateStatus("⚠️ 送りすぎのためDiscord側で制限中。少し時間を置きます。");
+        } else {
+          updateStatus(`❌ 送信エラー (HTTP Status: ${response.status})`);
+        }
+      } catch (err) {
+        console.error("送信エラー:", err);
+        updateStatus("❌ エラー発生: " + err.message);
+      } finally {
+        isSending = false; // 送信完了（または失敗）したら復帰
+      }
     }
   </script>
 </body>
