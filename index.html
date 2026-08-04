@@ -72,35 +72,34 @@
       // WebSocket接続
       ws = new WebSocket(SIGNALING_SERVER);
 
-      ws.onopen = async () => {
-        updateStatus("サーバー接続完了。WebRTCを初期化中...");
-        setupPeerConnection();
+     // index.html の ws.onopen 付近を書き換え
+ws.onopen = async () => {
+  updateStatus("サーバー接続完了。WebRTCを初期化中...");
+  setupPeerConnection();
 
-        if (myRole === 'camera') {
-          try {
-            localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-            document.getElementById('localVideo').srcObject = localStream;
-            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-            
-            startMotionDetection();
-            updateStatus("カメラ準備完了。モニターの接続を待機中...");
-          } catch (err) {
-            alert("カメラ/マイクの起動に失敗しました: " + err);
-            updateStatus("エラー: カメラ起動失敗");
-          }
-        } else {
-          // モニター側
-          try {
-            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-          } catch (e) {
-            console.log("マイクなしで受信用として動作します");
-          }
-          updateStatus("モニター準備完了。カメラを探しています...");
-          sendOffer();
-        }
-      };
-
+  if (myRole === 'camera') {
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      document.getElementById('localVideo').srcObject = localStream;
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      
+      startMotionDetection();
+      updateStatus("カメラ準備完了。モニターの接続を待機中...");
+    } catch (err) {
+      alert("カメラ/マイクの起動に失敗しました: " + err);
+    }
+  } else {
+    // モニター側：カメラが見つかるまで3秒ごとに接続要求（Offer）を送る
+    updateStatus("モニター準備完了。カメラを探しています...");
+    const offerInterval = setInterval(() => {
+      if (pc.connectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        clearInterval(offerInterval); // 接続されたら停止
+      } else {
+        sendOffer();
+      }
+    }, 3000);
+  }
+};
       // メッセージの自動受信ハンドラ
       ws.onmessage = async (event) => {
         const msg = JSON.parse(event.data);
